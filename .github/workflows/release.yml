@@ -10,6 +10,11 @@ jobs:
   build:
     if: github.repository_owner == 'related-sciences'
     runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/oai_utils
+    permissions:
+      id-token: write
 
     steps:
     - uses: actions/checkout@v3
@@ -33,6 +38,3 @@ jobs:
     - name: Publish package
       if: github.event_name == 'release'
       uses: pypa/gh-action-pypi-publish@release/v1
-      with:
-        user: __token__
-        password: ${{ secrets.PYPI_API_TOKEN }}
