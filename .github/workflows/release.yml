@@ -7,7 +7,7 @@ on:
     - published
 
 jobs:
-  build:
+  release:
     if: github.repository_owner == 'related-sciences'
     runs-on: ubuntu-latest
     environment:
