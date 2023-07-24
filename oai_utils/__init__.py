@@ -1,4 +1,4 @@
-from openai_utils.openai_utils import (
+from oai_utils.openai_utils import (
     OpenAIChatCompletionRequest,
     chat_completion,
     chat_completion_batch,

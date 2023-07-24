@@ -27,8 +27,8 @@ from tenacity import (
 )
 from tqdm.contrib.concurrent import thread_map
 
-from openai_utils.result import Failure, Result, Success
-from openai_utils.utils import batch, flatten, is_required, log_time
+from oai_utils.result import Failure, Result, Success
+from oai_utils.utils import batch, flatten, is_required, log_time
 
 logger = logging.getLogger(__name__)
 

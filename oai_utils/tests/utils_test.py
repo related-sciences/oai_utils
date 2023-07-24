@@ -4,7 +4,7 @@ import time
 import pytest
 from _pytest.logging import LogCaptureFixture
 
-from openai_utils.utils import batch, batch_gen, flatten, is_required, log_time
+from oai_utils.utils import batch, batch_gen, flatten, is_required, log_time
 
 
 def test_is_required():
@@ -27,7 +27,7 @@ def test_flatten():
 
 
 def test_log_time(caplog: LogCaptureFixture):
-    from openai_utils.utils import logger
+    from oai_utils.utils import logger
 
     logger.setLevel(logging.INFO)
     try:

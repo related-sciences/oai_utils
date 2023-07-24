@@ -1,5 +1,5 @@
 [project]
-name = "openai_utils"
+name = "oai_utils"
 description = "OpenAI Python Utils"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,7 +28,7 @@ dev = [
 ]
 
 [project.urls]
-repository = "https://github.com/related-sciences/openai_utils"
+repository = "https://github.com/related-sciences/oai_utils"
 
 [build-system]
 requires = ["setuptools >= 45", "setuptools_scm[toml] >= 6.2"]

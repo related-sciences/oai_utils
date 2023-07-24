@@ -1,6 +1,6 @@
 import pytest
 
-from openai_utils import (
+from oai_utils import (
     OpenAIChatCompletionRequest,
     chat_completion,
     chat_completion_batch,
