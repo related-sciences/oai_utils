@@ -1,4 +1,5 @@
 import copy
+import json
 import logging
 import os
 import sys
@@ -9,6 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import lru_cache
+from multiprocessing.dummy import Pool
 from threading import Lock
 from typing import Any, TypeVar, overload
 
@@ -25,16 +27,27 @@ from tenacity import (
     stop_after_attempt,
     wait_random_exponential,
 )
-from tqdm.contrib.concurrent import thread_map
+from tqdm import tqdm
 
 from oai_utils.result import Failure, Result, Success
 from oai_utils.utils import batch, flatten, is_required, log_time
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
+T = TypeVar("T", covariant=True)
 
 OPENAI_KEY_ENV_VAR = "OPENAI_API_KEY"
+
+CHAT_COMPLETION_BATCH_RECOMMENDED_N = int(
+    os.environ.get("RS_CHAT_COMPLETION_BATCH_RECOMMENDED_N", 5)
+)
+"""Default number of completions for chat completion requests
+
+Note that increasing the number of completions for a request incurs no greater input token
+cost but it roughly multiplies the output token cost by the number of completions. It will also
+likely increase the time necessary for the request, so this value should be increased or
+decreased (on a per request-basis) with some care.
+"""
 
 
 def monkey_patch_openai_logging() -> None:
@@ -68,41 +81,138 @@ def monkey_patch_openai_logging() -> None:
 monkey_patch_openai_logging()
 
 
+def num_tokens(messages: list[dict[str, str]] | str, model: str = "gpt-4") -> int:
+    """
+    Returns the number of tokens used by a list of messages.
+
+    This method was adapted from https://github.com/openai/openai-cookbook/blob/ebfdfe30998a15e6ab0a09a903d78b538d1da295/examples/How_to_count_tokens_with_tiktoken.ipynb
+    """
+    if model == "gpt-3.5-turbo":
+        return num_tokens(messages, model="gpt-3.5-turbo-0301")
+    elif model.startswith("gpt-4-"):
+        return num_tokens(messages, model="gpt-4")
+    elif model == "gpt-3.5-turbo-0301":
+        tokens_per_message = (
+            4  # every message follows <|start|>{role/name}\n{content}<|end|>\n
+        )
+        tokens_per_name = -1  # if there's a name, the role is omitted
+    elif model == "gpt-4":
+        tokens_per_message = 3
+        tokens_per_name = 1
+    else:
+        raise NotImplementedError(
+            f"""num_tokens_from_messages() is not implemented for model {model}. See https://github.com/openai/openai-python/blob/main/chatml.md for information on how messages are converted to tokens."""
+        )
+    encoding = tiktoken.encoding_for_model(model)
+
+    if isinstance(messages, str):
+        return len(encoding.encode(messages))
+    n = 0
+    for message in messages:
+        n += tokens_per_message
+        for key, value in message.items():
+            n += len(encoding.encode(value))
+            if key == "name":
+                n += tokens_per_name
+    n += 3  # every reply is primed with <|start|>assistant<|message|>
+    return n
+
+
+@overload
+def is_context_too_long(
+    *,
+    context: str | list[dict[str, str]],
+    model: str = "gpt-4",
+    completion_max_tokens: int = 16,
+) -> bool:
+    """
+    Returns True if the context is too long for the given model.
+
+    Parameters:
+        context: the context to check.
+        model: the model to check against, defaults to `gpt-4`.
+        completion_max_tokens: the buffer to add to the context length, see `max_tokens`
+                               of the completion API.
+    """
+    ...
+
+
+@overload
+def is_context_too_long(*, token_cnt: int, model: str = "gpt-4") -> bool:
+    """
+    Returns True if the context is too long for the given model.
+
+    Parameters:
+        token_cnt: token count.
+        model: the model to check against, defaults to `gpt-4`.
+    """
+    ...
+
+
+def is_context_too_long(
+    *,
+    context: str | list[dict[str, str]] | None = None,
+    token_cnt: int | None = None,
+    model: str = "gpt-4",
+    completion_max_tokens: int | None = None,
+) -> bool:
+    if token_cnt is None:
+        assert context is not None
+        total_tokens = num_tokens(context, model=model) + is_required(
+            completion_max_tokens
+        )
+    else:
+        total_tokens = token_cnt
+    if model.startswith("gpt-4") and "preview" in model and total_tokens >= 128000:
+        return True
+    elif model.startswith("gpt-4") and total_tokens >= 8192:
+        return True
+    elif model.startswith("gpt-3") and "16k" in model and total_tokens >= 16384:
+        return True
+    elif model.startswith("gpt-3") and total_tokens >= 4096:
+        return True
+    return False
+
+
 @lru_cache(maxsize=64)
 def price_per_1k_input_tokens_dollar(model: str) -> float:
+    if model.startswith("gpt-4") and "preview" in model:
+        return 0.01
     if model.startswith("gpt-4") and ("32k" not in model):
         return 0.03
     elif model.startswith("gpt-4") and ("32k" in model):
         return 0.06
-    elif model.startswith("gpt-3.5-turbo") and ("16k" not in model):
-        return 0.0015
-    elif model.startswith("gpt-3.5-turbo") and ("16k" in model):
-        return 0.003
+    elif model.startswith("gpt-3.5-turbo"):
+        return 0.0005
     elif model.startswith("text-embedding-ada-002"):
         return 0.0001
     else:
-        raise ValueError(f"Unknown model: {model!r}")
+        raise ValueError(
+            f"Unknown model: {model!r}, the model may exist but it's likely a deprecated one, please update."
+        )
 
 
 @lru_cache(maxsize=64)
 def price_per_1k_completion_tokens_dollar(model: str) -> float:
-    if model.startswith("gpt-4") and ("32k" not in model):
+    if model.startswith("gpt-4") and "preview" in model:
+        return 0.03
+    elif model.startswith("gpt-4") and ("32k" not in model):
         return 0.06
     elif model.startswith("gpt-4") and ("32k" in model):
         return 0.12
-    elif model.startswith("gpt-3.5-turbo") and ("16k" not in model):
-        return 0.002
-    elif model.startswith("gpt-3.5-turbo") and ("16k" in model):
-        return 0.004
+    elif model.startswith("gpt-3.5-turbo"):
+        return 0.0015
     elif model.startswith("text-embedding-ada-002"):
         return 0.0
     else:
-        raise ValueError(f"Unknown model: {model!r}")
+        raise ValueError(
+            f"Unknown model: {model!r}, the model may exist but it's likely a deprecated one, please update."
+        )
 
 
 @lru_cache(maxsize=1)
 def get_openai_api_key() -> str | None:
-    """Get OpenAI API key from RS Secrets"""
+    """Get OpenAI API"""
     return os.environ.get(OPENAI_KEY_ENV_VAR)
 
 
@@ -266,7 +376,7 @@ class OpenAIResult:
         )
 
 
-class RetryingOpenAI(Retrying):  # type: ignore[misc]
+class RetryingOpenAI(Retrying):  # type:ignore[misc]
     """
     Retrying wrapper for OpenAI API calls. Will retry rate limit errors ad infinitum.
     """
@@ -392,6 +502,13 @@ class OpenAIChatCompletionRequest(OpenAIRequest):
     logit_bias: dict[str, float] | None = None
     metadata: dict[str, str] | None = None
 
+    def __post_init__(self) -> None:
+        if isinstance(self.messages, str):
+            self.messages = get_messages(self.messages)
+
+    def __hash__(self) -> int:
+        return hash(json.dumps(self.__dict__, sort_keys=True))
+
 
 @dataclass
 class OpenAIChatCompletionRoundTrip:
@@ -481,8 +598,7 @@ def chat_completion(
             messages=is_required(messages), model=model, temperature=temperature
         )
     else:
-        if isinstance(request.messages, str):
-            request.messages = get_messages(request.messages)
+        assert isinstance(request.messages, list)
 
     # NOTE: due to lambda mypy can't infer that request is not None
     request_required = is_required(request)
@@ -508,28 +624,60 @@ def chat_completion(
     return OpenAIChatCompletionRoundTrip(request_required, result)
 
 
+def _failsafe_completion_fn(
+    request: OpenAIChatCompletionRequest,
+) -> OpenAIChatCompletionRoundTripFailSafe:
+    try:
+        if is_context_too_long(
+            context=request.messages, model=request.model, completion_max_tokens=42
+        ):
+            token_cnt = num_tokens(messages=request.messages, model=request.model)
+            raise ValueError(
+                f"Context of size {token_cnt:,} is too long for model {request.model}"
+            )
+        return OpenAIChatCompletionRoundTripFailSafe(
+            request, Success(chat_completion(request=request).response)
+        )
+    except Exception as e:
+        return OpenAIChatCompletionRoundTripFailSafe(request, Failure(request, e))
+
+
 def chat_completion_batch(
-    completion_requests: Iterable[OpenAIChatCompletionRequest], label: str
+    completion_requests: Iterable[OpenAIChatCompletionRequest],
+    label: str,
+    *,
+    max_threads: int | None = None,
+    cache: bool = False,
+    cache_location: str = "/tmp/gpt_cache",
+    cache_verbose: int = 0,
 ) -> Iterator[OpenAIChatCompletionRoundTripFailSafe]:
     """
     Given an iterator of completion requests, returns an iterator of failsafe
     completion round trips. Will print final API usage stats, `label` is used
     as a prefix for the stats (human-readable label for this completion batch).
+    `max_threads` is the maximum number of threads to use for parallelizing the
+    completions. If `max_threads` is None, will use the default number of threads
+    (usually the number of cores on the machine). If `cache` is True, will cache
+    the completions in a local directory, so that if the same completion request
+    is encountered again, it will be loaded from the cache instead of being
+    re-computed. For `cache_verbose` see joblib.memory.Memory.
     """
+    if cache:
+        from joblib import Memory
 
-    def failsafe_completion_fn(
-        request: OpenAIChatCompletionRequest,
-    ) -> OpenAIChatCompletionRoundTripFailSafe:
-        try:
-            return OpenAIChatCompletionRoundTripFailSafe(
-                request, Success(chat_completion(request=request).response)
-            )
-        except Exception as e:
-            return OpenAIChatCompletionRoundTripFailSafe(request, Failure(request, e))
+        memory = Memory(cache_location, verbose=cache_verbose)
+        failsafe_completion_fn = memory.cache(_failsafe_completion_fn)
+    else:
+        failsafe_completion_fn = _failsafe_completion_fn
 
     with log_openai_usage(label):
-        # TODO: make this actually lazy iterable, ATM thread_map is eager
-        yield from thread_map(failsafe_completion_fn, completion_requests)
+        with Pool(processes=max_threads) as thread_pool:
+            yield from tqdm(
+                thread_pool.imap(failsafe_completion_fn, completion_requests),
+                total=len(completion_requests)  # type: ignore[arg-type]
+                if hasattr(completion_requests, "__len__")
+                else None,
+            )
 
 
 def embedding(

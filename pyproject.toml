@@ -13,6 +13,7 @@ classifiers = [
   "Programming Language :: Python"
 ]
 dependencies = [
+  "joblib < 1.4",
   "numpy < 2",
   "openai < 1",
   "tenacity < 9",
