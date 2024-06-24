@@ -96,7 +96,10 @@ def num_tokens(messages: list[dict[str, str]] | str, model: str = "gpt-4") -> in
             4  # every message follows <|start|>{role/name}\n{content}<|end|>\n
         )
         tokens_per_name = -1  # if there's a name, the role is omitted
-    elif model == "gpt-4":
+    elif model in [
+        "gpt-4",
+        "gpt-4o",  # TODO: confirm gpt-4o rules are same as gpt-4, see https://github.com/related-sciences/oai_utils/pull/2
+    ]:
         tokens_per_message = 3
         tokens_per_name = 1
     else:
