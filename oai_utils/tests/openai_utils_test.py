@@ -6,8 +6,19 @@ from oai_utils import (
     chat_completion_batch,
     embedding,
 )
+from oai_utils.openai_utils import num_tokens
 
 pytestmark = pytest.mark.openai_api_tests
+
+
+@pytest.mark.parametrize("model", ["gpt-3.5-turbo", "gpt-4", "gpt-4o"])
+def test_support_different_model_tokens(model):
+    assert (
+        num_tokens(
+            "What is the answer to life, the universe, and everything?", model=model
+        )
+        == 13
+    )
 
 
 def test_chat_completion__dummy():
